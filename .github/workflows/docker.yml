@@ -6,6 +6,13 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# Least-privilege default. Note this workflow deliberately has no
+# `pull_request` trigger (only `push`/`workflow_dispatch`), so DOCKERHUB_*
+# secrets are never evaluated against an untrusted fork's PR code/context —
+# don't add `pull_request` here without also isolating the secrets.
+permissions:
+  contents: read
+
 jobs:
   build-push:
     name: Build and push multi-platform image

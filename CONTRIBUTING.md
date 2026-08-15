@@ -60,6 +60,11 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+`cargo test` requires a running Redis on `127.0.0.1:6379` (or set
+`REDIS_URL`) — `tests/integration_redis.rs` runs real `Queue`/`Worker`
+traffic against it. `docker compose up -d redis` is the quickest way to get
+one locally.
+
 For a full end-to-end smoke test (requires a running Redis on `127.0.0.1:6379`):
 
 ```bash

@@ -1,5 +1,5 @@
-use crate::metrics::{LatencyStats, TrialResult};
 use anyhow::Result;
+use bullmq_bench::metrics::{LatencyStats, TrialResult};
 use chrono::{DateTime, Utc};
 use comfy_table::{Cell, Table};
 use serde::Serialize;

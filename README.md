@@ -38,10 +38,25 @@ Docs: [docs.bullmq.io/rust/introduction](https://docs.bullmq.io/rust/introductio
 
 **Crate maturity note:** `bullmq-official` is brand new — first published to
 crates.io on 2026-07-12, with the version this benchmark is built and tested
-against (**1.2.4**) published 2026-08-13. It is still evolving quickly. Every
-protocol claim below was checked against that exact version's source and
-verified empirically with `redis-cli MONITOR` (not just read off the docs) —
-see the exact commands captured in [Verifying the protocol](#verifying-the-protocol).
+against (**1.2.5**) published 2026-08-15 (1.2.5's only change since 1.2.4 was
+an internal `SCRIPT EXISTS` check before loading Lua scripts —
+[taskforcesh/bullmq#4563](https://github.com/taskforcesh/bullmq/pull/4563) —
+no API or protocol changes). It is still evolving quickly. Every protocol
+claim below was checked against that exact version's source and verified
+empirically with `redis-cli MONITOR` (not just read off the docs) — see the
+exact commands captured in [Verifying the protocol](#verifying-the-protocol).
+
+**Known upstream bug (worked around here):** `Queue::obliterate(force, ..)`'s
+`force` argument doesn't actually gate removal of ACTIVE (in-flight) jobs.
+`obliterate-2.lua`'s own guard is `if ARGV[2] == "" then return -2 end`, but
+the Rust binding always sends `force_str = if force {"1"} else {"0"}` — never
+an empty string — so that branch can never fire; active jobs are
+force-removed regardless of what `force` is set to. Verified empirically (a
+job kept genuinely active by a slow processor survived `obliterate(false,
+..)`). This benchmark works around it in `src/producer.rs::clear_queues` by
+checking `Queue::get_active_count()` itself before ever calling `obliterate`
+— see [Safety notes](#safety-notes) below for what that means for
+`--allow-obliterate-active`.
 
 - **Dequeue is `BZPOPMIN` on a shared marker key, not `BRPOP`.** Every BullMQ
   worker blocks on `BZPOPMIN bull:<queue>:marker <timeout>` — a sorted set
@@ -91,6 +106,20 @@ see the exact commands captured in [Verifying the protocol](#verifying-the-proto
   processes, each with its own connection, all blocked on the same marker
   key — this benchmark spawns N separate `Worker` instances at
   `concurrency = 1` each. See the full rationale in `src/worker.rs`.
+
+  **Resource cost of this:** each `Worker` instance opens 2 Redis
+  connections (one multiplexed command connection, one dedicated blocking
+  connection for `BZPOPMIN`) and spawns 3 background tasks (main loop,
+  stalled-job check, lock renewal). `--workers 500` therefore needs roughly
+  1,000 Redis connections. This benchmark spawns workers in bounded batches
+  of 64 (rather than firing all N connections at Redis simultaneously) and
+  prints a warning above `--workers 256` reminding you to check `ulimit -n`
+  and the Redis server's `maxclients` first. If a spawn batch still fails
+  (fd/connection exhaustion), that concurrency level is cleanly closed and
+  skipped — printed as a warning, with the process exiting non-zero — rather
+  than the whole run losing every earlier level's already-collected results;
+  see `run_trial`'s spawn loop and `main`'s per-level error boundary in
+  `src/main.rs`.
 
 ### What `bullmq-official` doesn't implement yet (and why it doesn't affect this benchmark)
 
@@ -217,6 +246,7 @@ cargo build --release
 | `--timeout` | — | `300` | Per-trial timeout in seconds |
 | `--quiet` | — | false | Suppress per-second progress dots |
 | `--allow-flushdb` | `BULLMQ_BENCH_ALLOW_FLUSHDB` | false | `FLUSHDB` before each trial (default: `Queue::obliterate` on only the configured queue(s) — safe on shared Redis) |
+| `--allow-obliterate-active` | `BULLMQ_BENCH_ALLOW_OBLITERATE_ACTIVE` | false | Allow pre-trial cleanup to force-remove ACTIVE (in-flight) jobs from the target queue(s). See [Safety notes](#safety-notes) |
 
 ### Multi-queue mode
 
@@ -330,6 +360,34 @@ default. Always confirm the target db before running against a shared Redis.
 Do **not** run this benchmark against a production Redis instance. Each
 trial enqueues thousands of jobs and (optionally) flushes the entire
 database. Use a dedicated benchmark instance or an isolated database number.
+
+### Active-job removal is gated behind `--allow-obliterate-active`
+
+Pre-trial cleanup uses `Queue::obliterate`, which only ever touches keys
+under the target queue's own prefix — it cannot affect unrelated queues in
+the same Redis/db. It *can* still affect the same-named queue of a real,
+unrelated BullMQ application if `--queue` collides with a real production
+queue name (`"default"`, this tool's own default, is also the single most
+common real one).
+
+By default, if the target queue currently has ACTIVE (in-flight) jobs —
+jobs a real worker might be processing *right now* — pre-trial cleanup
+refuses to touch that queue at all and fails with a clear error, instead of
+destroying them. Pass `--allow-obliterate-active` (or set
+`BULLMQ_BENCH_ALLOW_OBLITERATE_ACTIVE=1`) to override — the main legitimate
+reason to need it is cleaning up after this benchmark's *own* trial timed
+out and left active jobs behind. Non-active jobs (waiting/completed/failed/
+delayed) are always cleared either way; this gate only concerns work
+genuinely in flight.
+
+This check is implemented ourselves (via `Queue::get_active_count()`)
+rather than by relying on `Queue::obliterate`'s own `force` parameter — see
+[Protocol compatibility](#protocol-compatibility) above for the upstream bug
+that makes `force` alone insufficient. Covered by
+`clear_queues_refuses_active_jobs_without_explicit_opt_in` in
+`tests/integration_redis.rs`, which reproduces the upstream bug directly
+(keeps a job active with a slow processor, confirms `force=false` behavior
+without this gate would have removed it, then confirms the gate blocks it).
 
 ### Jobs are removed on completion — unlike BullMQ's own default
 

@@ -49,6 +49,14 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+`cargo test` requires a running Redis on `127.0.0.1:6379` (or set `REDIS_URL`)
+— `tests/integration_redis.rs` drives real `Queue`/`Worker` plumbing against
+it (see that file's module doc for what it covers: full job lifecycle
+including the completion leg, BZPOPMIN starvation + exactly-once claiming,
+and the `--allow-obliterate-active` safety gate). CI provisions this via the
+`redis:8.6` `services:` block in `.github/workflows/ci.yml`, up for the whole
+job. Locally: `docker compose up -d redis`.
+
 For a full end-to-end smoke test (requires Redis on `127.0.0.1:6379`):
 
 ```bash

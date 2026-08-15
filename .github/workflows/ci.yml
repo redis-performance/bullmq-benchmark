@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+# Least-privilege default: this workflow only builds/tests, it never needs to
+# write to the repo. Explicit here so a future step added to this job can't
+# silently inherit broad default GITHUB_TOKEN permissions.
+permissions:
+  contents: read
+
 jobs:
   ci:
     name: Build, lint, test, smoke

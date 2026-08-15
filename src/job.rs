@@ -26,13 +26,21 @@ pub struct JobPayload {
 
 impl JobPayload {
     /// Build a payload for job `seq`, stamped with the current time.
+    ///
+    /// `duration_since` only errors if the system clock reads before
+    /// UNIX_EPOCH — an environment problem, not something the producer
+    /// (running on a fixed schedule enqueuing potentially hundreds of
+    /// thousands of jobs) should panic over. Falls back to 0 rather than
+    /// aborting the whole enqueue batch; the worker side treats an
+    /// out-of-order timestamp as clock skew (see `worker.rs`), not a crash.
     pub fn new(seq: u64) -> Self {
-        let now = SystemTime::now()
+        let now_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("clock before epoch");
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
         Self {
             seq,
-            enqueued_at_ns: now.as_nanos() as u64,
+            enqueued_at_ns: now_ns,
         }
     }
 

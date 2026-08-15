@@ -1,12 +1,9 @@
-mod job;
-mod metrics;
-mod producer;
 mod report;
-mod worker;
 
 use anyhow::{Context, Result};
 use bullmq::options::RedisConnectionOptions;
 use bullmq::{Queue, QueueOptions};
+use bullmq_bench::{metrics, producer, worker};
 use clap::Parser;
 use hdrhistogram::Histogram;
 use metrics::{LatencyStats, Metrics, TrialResult};
@@ -112,14 +109,34 @@ struct Cli {
     /// which is safe on shared Redis.
     #[arg(long, env = "BULLMQ_BENCH_ALLOW_FLUSHDB")]
     allow_flushdb: bool,
+
+    /// Allow force-removing ACTIVE (in-flight) jobs from the target queue(s)
+    /// during pre-trial cleanup.
+    ///
+    /// `Queue::obliterate`'s `force` flag doesn't just clear waiting jobs —
+    /// it also deletes jobs that are *currently being processed*, which on a
+    /// shared Redis could belong to a real, unrelated worker mid-job (e.g. if
+    /// `--queue` collides with a real application's queue name, "default"
+    /// being the single most common one). Without this flag, pre-trial
+    /// cleanup refuses to touch a queue that has active jobs and fails with a
+    /// clear error instead of silently destroying them. This flag exists
+    /// purely to let re-runs proceed after our OWN trial times out and
+    /// leaves active jobs behind — it is not needed for a first run against
+    /// an empty/dedicated queue.
+    #[arg(long, env = "BULLMQ_BENCH_ALLOW_OBLITERATE_ACTIVE")]
+    allow_obliterate_active: bool,
 }
 
 // ── Redis URL helpers ─────────────────────────────────────────────────────────
 // (Protocol-agnostic — copied from sidekiq-benchmark's main.rs verbatim.)
 
 fn build_redis_url(cli: &Cli) -> Result<String> {
-    let mut u =
-        url::Url::parse(&cli.url).with_context(|| format!("invalid Redis URL: {}", cli.url))?;
+    // NOTE: every error path below must use `redact_url(&cli.url)`, never
+    // `cli.url` directly — `--url` can carry an embedded password
+    // (`redis://:secret@host/0`), and these messages can end up on stderr /
+    // in CI logs via anyhow's default `main() -> Result<()>` error printing.
+    let mut u = url::Url::parse(&cli.url)
+        .with_context(|| format!("invalid Redis URL: {}", redact_url(&cli.url)))?;
 
     if let Some(host) = &cli.host {
         u.set_host(Some(host))
@@ -127,7 +144,7 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     }
     if let Some(port) = cli.port {
         u.set_port(Some(port))
-            .map_err(|_| anyhow::anyhow!("cannot set port on URL: {}", cli.url))?;
+            .map_err(|_| anyhow::anyhow!("cannot set port on URL: {}", redact_url(&cli.url)))?;
     }
     if cli.tls && u.scheme() == "redis" {
         u.set_scheme("rediss")
@@ -136,7 +153,7 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     if let Some(password) = &cli.password {
         // url::Url::set_password percent-encodes special characters (e.g. '@', '/', ':')
         u.set_password(Some(password))
-            .map_err(|_| anyhow::anyhow!("cannot set password on URL: {}", cli.url))?;
+            .map_err(|_| anyhow::anyhow!("cannot set password on URL: {}", redact_url(&cli.url)))?;
     }
     // Ensure db path is present
     if u.path().trim_matches('/').is_empty() {
@@ -146,16 +163,37 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     Ok(u.to_string())
 }
 
-/// Return the URL with the password replaced by **** for logging and JSON output.
+/// Return the URL with any embedded password replaced by `****`, for
+/// logging, error messages, and JSON output.
+///
+/// Falls back to a syntactic scrub (rather than returning the raw string
+/// verbatim) when `url::Url::parse` rejects the input — which is exactly the
+/// case in `build_redis_url`'s own error paths, where `--url` failed to
+/// parse but may still contain a real, human-supplied password between
+/// `://` and `@`.
 fn redact_url(raw: &str) -> String {
-    match url::Url::parse(raw) {
-        Ok(mut u) => {
-            if u.password().is_some() {
-                let _ = u.set_password(Some("****"));
-            }
-            u.to_string()
+    if let Ok(mut u) = url::Url::parse(raw) {
+        if u.password().is_some() {
+            let _ = u.set_password(Some("****"));
         }
-        Err(_) => raw.to_string(),
+        return u.to_string();
+    }
+
+    let Some(scheme_end) = raw.find("://") else {
+        return raw.to_string();
+    };
+    let authority_start = scheme_end + 3;
+    let authority_end = raw[authority_start..]
+        .find(['/', '?', '#'])
+        .map(|i| authority_start + i)
+        .unwrap_or(raw.len());
+    match raw[authority_start..authority_end].rfind('@') {
+        Some(at_rel) => format!(
+            "{}****{}",
+            &raw[..authority_start],
+            &raw[authority_start + at_rel..]
+        ),
+        None => raw.to_string(),
     }
 }
 
@@ -230,6 +268,16 @@ fn parse_percentile_spec(s: &str) -> Result<PercentileSpec> {
         s if s.starts_with('p') => {
             let digits = &s[1..];
             anyhow::ensure!(!digits.is_empty(), "invalid percentile spec: '{s}'");
+            // Bounds digits.len() before it feeds 10u64.pow() below. u64::parse
+            // already rejects most absurdly long inputs, but leading zeros let
+            // digits.len() run arbitrarily long while still parsing to a small
+            // `n` (e.g. "p" + 100 zeros + "50") — pow(100) overflows u64 (panics
+            // in a debug/test build; silently wraps in release), so cap it well
+            // above any legitimate percentile spec instead of relying on that.
+            anyhow::ensure!(
+                digits.len() <= 18,
+                "invalid percentile spec: '{s}' (too many digits)"
+            );
             let n: u64 = digits
                 .parse()
                 .with_context(|| format!("invalid percentile spec: '{s}'"))?;
@@ -350,23 +398,57 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let n_queues = cfg.queue_names.len();
     anyhow::ensure!(n_queues > 0, "no queues configured");
 
-    let mut spawn_futs = Vec::with_capacity(n_workers);
-    for i in 0..n_workers {
-        let queue_name = cfg.queue_names[i % n_queues].clone();
-        // Only the very first worker performs the Redis version check; the
-        // rest skip it to avoid n_workers redundant round trips at spawn time.
-        let opts = worker::build_worker_options(cfg.url, i != 0);
-        let metrics = metrics.clone();
-        let latency_tx = latency_tx.clone(); // worker holds a clone; main keeps the sentinel
-        let done_tx = done_tx.clone();
-        let target_jobs = cfg.jobs;
-        spawn_futs.push(async move {
-            worker::spawn_worker(&queue_name, opts, metrics, latency_tx, done_tx, target_jobs).await
-        });
+    // Each Worker instance opens 2 TCP connections (one multiplexed command
+    // connection, one dedicated blocking connection for BZPOPMIN) and spawns
+    // 3 background tasks (main loop, stalled-job check, lock renewal). Spawn
+    // in bounded batches rather than firing all n_workers connections at
+    // Redis simultaneously — this bounds the peak fd/connection burst and,
+    // if the OS or Redis's maxclients rejects a connection partway through
+    // (e.g. `--workers 1000` against a low ulimit -n), fails within one
+    // batch's worth of partially-open connections instead of ~n_workers of
+    // them, and gives us a clean point to close() everything spawned so far
+    // (see the Err arm below) instead of leaking live connections/background
+    // tasks — `Worker`'s own `Drop` only flags an internal `closing` bool, it
+    // does not abort those tasks or close the sockets itself.
+    const WORKER_SPAWN_BATCH_SIZE: usize = 64;
+    const WORKER_CLOSE_TIMEOUT_MS: u64 = 5_000;
+
+    let mut workers = Vec::with_capacity(n_workers);
+    for batch_start in (0..n_workers).step_by(WORKER_SPAWN_BATCH_SIZE) {
+        let batch_end = (batch_start + WORKER_SPAWN_BATCH_SIZE).min(n_workers);
+        let mut spawn_futs = Vec::with_capacity(batch_end - batch_start);
+        for i in batch_start..batch_end {
+            let queue_name = cfg.queue_names[i % n_queues].clone();
+            // Only the very first worker performs the Redis version check;
+            // the rest skip it to avoid n_workers redundant round trips.
+            let opts = worker::build_worker_options(cfg.url, i != 0);
+            let metrics = metrics.clone();
+            let latency_tx = latency_tx.clone(); // worker holds a clone; main keeps the sentinel
+            let done_tx = done_tx.clone();
+            let target_jobs = cfg.jobs;
+            spawn_futs.push(async move {
+                worker::spawn_worker(&queue_name, opts, metrics, latency_tx, done_tx, target_jobs)
+                    .await
+            });
+        }
+        match futures::future::try_join_all(spawn_futs).await {
+            Ok(mut spawned) => workers.append(&mut spawned),
+            Err(e) => {
+                let spawned_so_far = workers.len();
+                let _ = futures::future::join_all(
+                    workers.iter().map(|w| w.close(WORKER_CLOSE_TIMEOUT_MS)),
+                )
+                .await;
+                anyhow::bail!(
+                    "failed to spawn BullMQ worker ({spawned_so_far} of {n_workers} spawned \
+                     before the failure, now closed): {e}\n  hint: each worker opens 2 Redis \
+                     connections — {n_workers} workers need roughly {approx} connections total. \
+                     Check `ulimit -n` and the Redis server's `maxclients`, or lower --workers.",
+                    approx = n_workers * 2
+                );
+            }
+        }
     }
-    let workers = futures::future::try_join_all(spawn_futs)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to spawn BullMQ worker: {e}"))?;
 
     // Per-second samples collected by the monitor task
     let throughput_samples: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
@@ -453,7 +535,8 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     // Graceful shutdown: ask every worker to close (waits for its one
     // in-flight job, if any, up to the timeout, then tears down its internal
     // tasks). Bounded so a stuck worker can't hang the whole trial.
-    const WORKER_CLOSE_TIMEOUT_MS: u64 = 5_000;
+    // (WORKER_CLOSE_TIMEOUT_MS is defined above, next to the spawn loop that
+    // also uses it for cleanup-on-partial-spawn-failure.)
     let _ =
         futures::future::join_all(workers.iter().map(|w| w.close(WORKER_CLOSE_TIMEOUT_MS))).await;
 
@@ -498,17 +581,40 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
 }
 
 /// Clear queues before a trial. Uses `Queue::obliterate` by default; FLUSHDB
-/// only when explicitly allowed.
+/// only when explicitly allowed. `allow_obliterate_active` gates whether
+/// obliterate is allowed to force-remove ACTIVE (in-flight) jobs — see the
+/// `--allow-obliterate-active` doc comment on `Cli` for why this matters.
 async fn pre_trial_clear(
     queues: &[Queue],
     conn: &mut redis::aio::MultiplexedConnection,
     allow_flushdb: bool,
+    allow_obliterate_active: bool,
 ) -> Result<()> {
     if allow_flushdb {
         producer::flushdb(conn).await
     } else {
-        producer::clear_queues(queues).await
+        producer::clear_queues(queues, allow_obliterate_active).await
     }
+}
+
+/// Reject CLI values that can't produce a sane trial before any Redis
+/// connection or spawning happens — fail fast and clearly rather than, e.g.,
+/// `--workers 0` silently burning the full `--timeout` with zero throughput,
+/// or `--timeout 0` making every trial an instant no-op.
+fn validate_cli(cli: &Cli) -> Result<()> {
+    anyhow::ensure!(cli.jobs > 0, "--jobs must be > 0");
+    anyhow::ensure!(cli.num_queues > 0, "--num-queues must be > 0");
+    anyhow::ensure!(cli.timeout > 0, "--timeout must be > 0");
+    anyhow::ensure!(
+        !cli.workers.is_empty(),
+        "--workers must specify at least one concurrency level"
+    );
+    anyhow::ensure!(
+        cli.workers.iter().all(|&w| w > 0),
+        "--workers values must all be > 0 (got 0 — a 0-worker trial can never complete and \
+         would just burn the full --timeout doing nothing)"
+    );
+    Ok(())
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -517,8 +623,17 @@ async fn pre_trial_clear(
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    anyhow::ensure!(cli.jobs > 0, "--jobs must be > 0");
-    anyhow::ensure!(cli.num_queues > 0, "--num-queues must be > 0");
+    validate_cli(&cli)?;
+    if let Some(&max_w) = cli.workers.iter().max() {
+        if max_w > 256 {
+            eprintln!(
+                "warning: --workers up to {max_w} — each worker opens ~2 Redis connections and \
+                 3 background tasks, so this trial needs roughly {approx} connections. Check \
+                 `ulimit -n` and the Redis server's `maxclients` before running.",
+                approx = max_w * 2
+            );
+        }
+    }
 
     let url = build_redis_url(&cli)?;
     let display_url = redact_url(&url);
@@ -635,6 +750,7 @@ async fn main() -> Result<()> {
     let workers_list = cli.workers.clone();
     let mut results: Vec<TrialResult> = Vec::new();
     let mut any_timeout = false;
+    let mut any_trial_failed = false;
 
     // Warn if the queue fill will likely use significant Redis memory. BullMQ
     // jobs are heavier than Sidekiq's: a job hash (name, data, opts, timestamps,
@@ -649,30 +765,60 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Each concurrency level's clear+enqueue+run is wrapped in its own error
+    // boundary: a failure at one level (e.g. `--workers 1000` exhausting fds
+    // partway through worker spawn — see run_trial's spawn loop) skips just
+    // that level and moves on, instead of an unhandled `?` aborting the
+    // whole process and discarding every earlier level's already-collected
+    // results before they ever reach report::write_json below.
     for &n_workers in &workers_list {
-        if cli.warmup_jobs > 0 {
-            pre_trial_clear(&queues, &mut conn, cli.allow_flushdb).await?;
-            producer::bulk_enqueue(&queues, cli.warmup_jobs).await?;
-            if !cli.quiet {
-                print!("  [{n_workers:>4} workers] warmup … ");
+        let outcome: Result<()> = async {
+            if cli.warmup_jobs > 0 {
+                pre_trial_clear(
+                    &queues,
+                    &mut conn,
+                    cli.allow_flushdb,
+                    cli.allow_obliterate_active,
+                )
+                .await?;
+                producer::bulk_enqueue(&queues, cli.warmup_jobs).await?;
+                if !cli.quiet {
+                    print!("  [{n_workers:>4} workers] warmup … ");
+                }
+                run_trial(&warmup_cfg, n_workers).await?;
             }
-            run_trial(&warmup_cfg, n_workers).await?;
+
+            pre_trial_clear(
+                &queues,
+                &mut conn,
+                cli.allow_flushdb,
+                cli.allow_obliterate_active,
+            )
+            .await?;
+            producer::bulk_enqueue(&queues, cli.jobs).await?;
+
+            if !cli.quiet {
+                print!("  [{n_workers:>4} workers] ");
+            }
+
+            let result = run_trial(&cfg, n_workers).await?;
+
+            if result.timed_out {
+                any_timeout = true;
+            }
+            report::print_trial_line(&result);
+            results.push(result);
+            Ok(())
         }
+        .await;
 
-        pre_trial_clear(&queues, &mut conn, cli.allow_flushdb).await?;
-        producer::bulk_enqueue(&queues, cli.jobs).await?;
-
-        if !cli.quiet {
-            print!("  [{n_workers:>4} workers] ");
+        if let Err(e) = outcome {
+            any_trial_failed = true;
+            if !cli.quiet {
+                println!();
+            }
+            eprintln!("warning: concurrency level {n_workers} failed and was skipped: {e:#}");
         }
-
-        let result = run_trial(&cfg, n_workers).await?;
-
-        if result.timed_out {
-            any_timeout = true;
-        }
-        report::print_trial_line(&result);
-        results.push(result);
     }
 
     report::print_summary(&results);
@@ -688,8 +834,16 @@ async fn main() -> Result<()> {
         &output,
     )?;
 
+    if any_trial_failed {
+        eprintln!(
+            "warning: one or more concurrency levels failed to run — see warnings above; \
+             results include only the levels that completed"
+        );
+    }
     if any_timeout {
         eprintln!("warning: one or more trials timed out — results are incomplete");
+    }
+    if any_trial_failed || any_timeout {
         std::process::exit(1);
     }
 
@@ -737,6 +891,67 @@ mod tests {
     }
 
     #[test]
+    fn redact_url_scrubs_password_even_when_url_fails_to_parse() {
+        // Deliberately malformed (space in the host) so url::Url::parse
+        // rejects it — this is exactly the shape of input that reaches
+        // redact_url from build_redis_url's own parse-failure error path.
+        let raw = "redis://:hunter2@bad host/0";
+        assert!(
+            url::Url::parse(raw).is_err(),
+            "test fixture should be malformed"
+        );
+        let redacted = redact_url(raw);
+        assert!(
+            !redacted.contains("hunter2"),
+            "password leaked from a malformed URL: {redacted}"
+        );
+        assert!(redacted.contains("****"), "no redaction marker: {redacted}");
+    }
+
+    #[test]
+    fn redact_url_malformed_without_userinfo_is_unchanged() {
+        // No '@' before the path — nothing to scrub, and the fallback must
+        // not corrupt the string.
+        let raw = "redis://bad host/0";
+        assert_eq!(redact_url(raw), raw);
+    }
+
+    #[test]
+    fn build_redis_url_error_never_leaks_password() {
+        // A malformed --url (space in the host) that still carries a real,
+        // human-supplied password before the '@'. url::Url::parse rejects
+        // this outright, hitting build_redis_url's *first* error path — the
+        // one that used to interpolate cli.url raw into the error message,
+        // leaking the password to stderr/CI logs via anyhow's default error
+        // printing.
+        let cli = Cli {
+            url: "redis://:hunter2secret@bad host/0".into(),
+            host: None,
+            port: None,
+            password: None,
+            tls: false,
+            db: 0,
+            workers: vec![10],
+            jobs: 1000,
+            warmup_jobs: 0,
+            queue: "default".into(),
+            num_queues: 1,
+            latency_percentiles: vec![],
+            tag: None,
+            output: None,
+            timeout: 300,
+            quiet: false,
+            allow_flushdb: false,
+            allow_obliterate_active: false,
+        };
+        let err = build_redis_url(&cli).unwrap_err();
+        assert!(
+            !format!("{err:#}").contains("hunter2secret"),
+            "error message leaked a secret: {err:#}"
+        );
+    }
+
+    #[test]
     fn build_redis_url_encodes_special_chars_in_password() {
         let cli = Cli {
             url: "redis://127.0.0.1:6379/0".into(),
@@ -756,6 +971,7 @@ mod tests {
             timeout: 300,
             quiet: false,
             allow_flushdb: false,
+            allow_obliterate_active: false,
         };
         let url = build_redis_url(&cli).unwrap();
         let parsed = url::Url::parse(&url).unwrap();
@@ -785,6 +1001,7 @@ mod tests {
             timeout: 300,
             quiet: false,
             allow_flushdb: false,
+            allow_obliterate_active: false,
         };
         let url = build_redis_url(&cli).unwrap();
         assert!(url.starts_with("rediss://"), "expected rediss:// got {url}");
@@ -810,6 +1027,7 @@ mod tests {
             timeout: 300,
             quiet: false,
             allow_flushdb: false,
+            allow_obliterate_active: false,
         };
         let url = build_redis_url(&cli).unwrap();
         let parsed = url::Url::parse(&url).unwrap();
@@ -856,8 +1074,89 @@ mod tests {
     }
 
     #[test]
+    fn parse_percentile_spec_rejects_pathological_leading_zeros() {
+        // Leading zeros let digits.len() run long while `n` stays tiny —
+        // this used to reach `10u64.pow(digits.len())` unguarded and
+        // overflow (panics in a debug/test build).
+        let s = format!("p{}50", "0".repeat(100));
+        assert!(parse_percentile_spec(&s).is_err());
+    }
+
+    #[test]
     fn make_queue_names_single_and_multi() {
         assert_eq!(make_queue_names("default", 1), vec!["default"]);
         assert_eq!(make_queue_names("q", 3), vec!["q_0", "q_1", "q_2"]);
+    }
+
+    fn base_cli() -> Cli {
+        Cli {
+            url: "redis://127.0.0.1:6379/13".into(),
+            host: None,
+            port: None,
+            password: None,
+            tls: false,
+            db: 13,
+            workers: vec![10, 50],
+            jobs: 1000,
+            warmup_jobs: 0,
+            queue: "default".into(),
+            num_queues: 1,
+            latency_percentiles: vec!["p50".into()],
+            tag: None,
+            output: None,
+            timeout: 300,
+            quiet: false,
+            allow_flushdb: false,
+            allow_obliterate_active: false,
+        }
+    }
+
+    #[test]
+    fn validate_cli_accepts_defaults() {
+        assert!(validate_cli(&base_cli()).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_jobs() {
+        let mut cli = base_cli();
+        cli.jobs = 0;
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_num_queues() {
+        let mut cli = base_cli();
+        cli.num_queues = 0;
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_timeout() {
+        let mut cli = base_cli();
+        cli.timeout = 0;
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_empty_workers() {
+        let mut cli = base_cli();
+        cli.workers = vec![];
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_in_workers_list() {
+        let mut cli = base_cli();
+        cli.workers = vec![10, 0, 50];
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn make_queue_names_zero_is_treated_as_one() {
+        // n=0 can't happen in practice (main() validates --num-queues > 0
+        // before calling this), but make_queue_names itself stays safe
+        // regardless — it never returns an empty Vec, so any future caller
+        // indexing queue_names[0] can't panic on this input.
+        assert_eq!(make_queue_names("default", 0), vec!["default"]);
     }
 }

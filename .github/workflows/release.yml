@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+# Least-privilege default; the release job below elevates just the one
+# permission it actually needs (contents: write, to create the GitHub
+# Release and attach assets).
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.asset_name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native runners for both architectures — not QEMU/cross. This
+          # means the aarch64 build is compiled *and* the resulting binary
+          # is actually executed on real aarch64 hardware in the "Verify
+          # architecture" step below, which is a much stronger correctness
+          # check than inspecting the ELF header alone (the docker.yml
+          # workflow already proves QEMU works in this repo's CI, for the
+          # multi-arch container image — this workflow just doesn't need it
+          # since GitHub ships free hosted arm64 runners for public repos).
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+            asset_name: linux-x86_64-gnu
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            asset_name: linux-aarch64-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Verify architecture
+        run: |
+          set -eu
+          BIN=target/release/bullmq-bench
+          file "$BIN"
+          echo "--- ELF header ---"
+          readelf -h "$BIN" | grep -E 'Class|Machine'
+          case "${{ matrix.target }}" in
+            x86_64-*)
+              file "$BIN" | grep -q 'x86-64' || { echo "expected x86-64 binary"; exit 1; }
+              ;;
+            aarch64-*)
+              file "$BIN" | grep -q 'ARM aarch64' || { echo "expected aarch64 binary"; exit 1; }
+              ;;
+          esac
+          echo "--- running natively on ${{ matrix.os }} (proves it's not just correctly labeled, it actually executes on this arch) ---"
+          "$BIN" --version
+
+      - name: Package tarball
+        run: |
+          set -eu
+          STAGE="bullmq-bench-${{ github.ref_name }}-${{ matrix.asset_name }}"
+          mkdir -p "$STAGE"
+          cp target/release/bullmq-bench "$STAGE"/
+          cp LICENSE "$STAGE"/
+          cp README.md "$STAGE"/
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+          sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          mkdir -p dist
+          mv "${STAGE}.tar.gz" "${STAGE}.tar.gz.sha256" dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.asset_name }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -la dist/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

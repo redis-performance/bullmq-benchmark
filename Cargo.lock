@@ -166,9 +166,9 @@ dependencies = [
 
 [[package]]
 name = "bullmq-official"
-version = "1.2.4"
+version = "1.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71217656439a266fb77296bd175cbb08494533d89de1f537a7011c9eb8214e91"
+checksum = "0ba0084aaadf721eea1b843189db47b33ed843f26eb07d7943e93c5c740dbb0d"
 dependencies = [
  "async-trait",
  "chrono",

@@ -76,10 +76,15 @@ pub async fn spawn_worker(
         let done_tx = done_tx.clone();
         Box::pin(async move {
             if let Some(enqueued_at_ns) = JobPayload::enqueued_at_ns(job.data()) {
+                // duration_since only errors if the system clock reads before
+                // UNIX_EPOCH (e.g. a misconfigured container clock). That's
+                // an environment problem, not a reason to panic a worker
+                // task mid-trial — fall back to 0 so this job is simply
+                // recorded as effectively zero-latency rather than lost.
                 let now_ns = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .expect("system clock is before UNIX_EPOCH")
-                    .as_nanos() as u64;
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
 
                 let latency_us = if now_ns >= enqueued_at_ns {
                     (now_ns - enqueued_at_ns) / 1_000

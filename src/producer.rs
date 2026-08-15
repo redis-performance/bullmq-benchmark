@@ -10,16 +10,76 @@ use bullmq::{BulkJob, Queue};
 /// future per job in the batch).
 const BATCH_SIZE: usize = 2000;
 
-/// Wipe all state for the given queues via BullMQ's `obliterate` (force=true
-/// pauses the queue first, then deletes every key under its prefix — job
-/// hashes, wait/active/marker/completed/failed/delayed sets, meta, everything).
-/// This is the default pre-trial cleanup — safe to use on shared Redis, since
-/// it only touches keys under each queue's own prefix.
-pub async fn clear_queues(queues: &[Queue]) -> Result<()> {
+/// Wipe all state for the given queues via BullMQ's `obliterate` (deletes
+/// every key under the queue's own prefix — job hashes,
+/// wait/active/marker/completed/failed/delayed sets, meta, everything). This
+/// only ever touches keys under each queue's own prefix, so it can't affect
+/// unrelated queues sharing the same Redis instance/db.
+///
+/// It *can* still affect the same-named queue of a real, unrelated BullMQ
+/// application if `--queue` collides with a real production queue name
+/// (`"default"`, this tool's own default, is also the single most common
+/// real one) — obliterate has no concept of "this benchmark's own jobs" vs.
+/// "someone else's jobs" beyond the queue name. `allow_active_removal` is
+/// this function's safety gate for the sharpest edge of that: without it, if
+/// the queue currently has ACTIVE (in-flight) jobs — i.e. jobs a real worker
+/// may be processing *right now* — we refuse to touch this queue at all
+/// instead of destroying them. Non-active jobs (waiting/completed/failed/
+/// delayed) are always removed either way — this gate only concerns work
+/// truly in flight.
+///
+/// This check is done ourselves via `get_active_count()`, deliberately NOT
+/// by trusting `Queue::obliterate`'s own `force` parameter: verified against
+/// bullmq-official 1.2.5 that it doesn't work. `obliterate-2.lua`'s own
+/// "don't touch active jobs" gate is `if ARGV[2] == "" then return -2 end`,
+/// but the Rust binding always sends `force_str = if force {"1"} else {"0"}`
+/// — never an empty string — so that branch can never fire and active jobs
+/// are force-removed unconditionally, for *both* `force=true` and
+/// `force=false`. (Confirmed empirically: a job kept genuinely active by a
+/// slow processor survives everything else in `obliterate-2.lua` except
+/// this check, and passing `force=false` did not save it.) There's a small
+/// unavoidable TOCTOU window between this check and the `obliterate` call
+/// below (a job could transition to active in between) — acceptable for a
+/// benchmark tool's pre-trial cleanup, where the alternative is no check at
+/// all.
+pub async fn clear_queues(queues: &[Queue], allow_active_removal: bool) -> Result<()> {
     for q in queues {
-        q.obliterate(true, 10_000)
-            .await
-            .with_context(|| format!("failed to obliterate queue '{}'", q.name()))?;
+        if !allow_active_removal {
+            let active = q.get_active_count().await.with_context(|| {
+                format!("failed to check active job count for queue '{}'", q.name())
+            })?;
+            anyhow::ensure!(
+                active == 0,
+                "queue '{}' has {active} active (in-flight) job(s) — refusing to clear it. If \
+                 this queue name is shared with a real BullMQ application, those jobs may belong \
+                 to a real worker processing them right now. Pass --allow-obliterate-active (env \
+                 BULLMQ_BENCH_ALLOW_OBLITERATE_ACTIVE) to override — e.g. to clean up after this \
+                 benchmark's own trial timed out and left active jobs behind — or use a --queue \
+                 name unique to this benchmark.",
+                q.name()
+            );
+        }
+
+        // obliterate-2.lua requires the queue to already be paused
+        // (unconditionally, regardless of `force`); the crate's own
+        // `Queue::obliterate` only calls `pause()` for us when `force=true`,
+        // so pause explicitly ourselves.
+        let _ = q.pause().await;
+        // `force` is passed as `true` here on purpose, not `allow_active_removal`
+        // — see the doc comment above: the crate's `force` argument doesn't
+        // actually gate active-job removal, our own check above is what does
+        // that, so there is no real distinction left to preserve by passing
+        // `false` through.
+        let result = q.obliterate(true, 10_000).await;
+        // obliterate deletes the queue's meta key (which holds the "paused"
+        // flag) once it fully clears the queue, so resume() is a no-op in
+        // that case. It matters if obliterate errors out instead and leaves
+        // the queue paused — without this, this benchmark's own subsequent
+        // `add_bulk` calls would route silently into the "paused" list
+        // instead of "wait" and never be picked up by any worker.
+        let _ = q.resume().await;
+
+        result.with_context(|| format!("failed to obliterate queue '{}'", q.name()))?;
     }
     Ok(())
 }

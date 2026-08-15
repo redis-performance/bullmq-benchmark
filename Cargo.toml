@@ -3,6 +3,12 @@ name = "bullmq-bench"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+# Exposes job/metrics/producer/worker so `tests/` integration tests can drive
+# real Queue/Worker plumbing without re-implementing it. See src/lib.rs.
+name = "bullmq_bench"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bullmq-bench"
 path = "src/main.rs"
@@ -12,9 +18,11 @@ path = "src/main.rs"
 # library itself is imported as `bullmq` — see its Cargo.toml [lib] name).
 # https://github.com/taskforcesh/bullmq/tree/master/rust
 # https://crates.io/crates/bullmq-official
-# Built and tested against 1.2.4 (published 2026-08-13 by manast). Pinned to
-# the 1.2 line since this crate is brand-new and still evolving quickly —
-# see README's "Protocol compatibility" section for exact version notes.
+# Built and tested against 1.2.5 (published 2026-08-15 by manast; 1.2.4's
+# only change was an internal SCRIPT EXISTS check before loading Lua scripts
+# — taskforcesh/bullmq#4563 — no API or protocol changes). Pinned to the 1.2
+# line since this crate is brand-new and still evolving quickly — see
+# README's "Protocol compatibility" section for exact version notes.
 bullmq-official = "1.2"
 
 # Redis client — used directly (outside the bullmq-official crate) for the
