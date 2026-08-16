@@ -168,7 +168,14 @@ interval while a worker waits for new jobs.)
 
 ## Quick start
 
-### Docker Hub
+Three ways to get `bullmq-bench` running, in order of convenience:
+
+### 1. Docker
+
+The image is published to
+[`redis/bullmq-benchmark`](https://hub.docker.com/r/redis/bullmq-benchmark)
+on Docker Hub (`linux/amd64` + `linux/arm64`, rebuilt on every push to
+`main`). This is the fastest way to run it — no toolchain required.
 
 > **Memory:** BullMQ jobs are heavier than Sidekiq's — each job is a Redis
 > hash (name, data, options, timestamps, …) plus wait/marker zset entries,
@@ -177,29 +184,31 @@ interval while a worker waits for new jobs.)
 > clean up after themselves via `Queue::obliterate` before the next one runs.
 
 ```bash
+docker pull redis/bullmq-benchmark:latest
+
 # Run against local Redis (default: db 13, 20k jobs, workers 10/50/100/200)
-docker run --rm --network host redis/bullmq-benchmark
+docker run --rm --network host redis/bullmq-benchmark:latest
 
 # Lighter local run
-docker run --rm --network host redis/bullmq-benchmark \
+docker run --rm --network host redis/bullmq-benchmark:latest \
   --workers 10,50 --jobs 5000
 
 # Custom settings
-docker run --rm --network host redis/bullmq-benchmark \
+docker run --rm --network host redis/bullmq-benchmark:latest \
   --url redis://127.0.0.1:6379/0 \
   --workers 10,50,100 \
   --jobs 50000 \
   --num-queues 4
 
 # Point at a remote Redis
-docker run --rm redis/bullmq-benchmark \
+docker run --rm redis/bullmq-benchmark:latest \
   --url redis://myhost:6379/0 \
   --workers 50,100,200 \
   --jobs 200000 \
   --output -
 ```
 
-### docker compose (Redis included)
+**docker compose (Redis included):**
 
 ```bash
 # Start Redis + run benchmark
@@ -212,13 +221,29 @@ REDIS_IMAGE=redis:7.4 docker compose run --rm bench
 REDIS_URL=redis://myhost:6379/0 docker compose run --rm bench
 ```
 
-### Pre-built binary
+### 2. Install from a GitHub Release
+
+Static Linux binaries (`x86_64`, `aarch64`) are attached to each
+[GitHub Release](https://github.com/redis-performance/bullmq-benchmark/releases),
+each as a tarball with a `.sha256` checksum alongside it.
 
 ```bash
-bullmq-bench --workers 10,50,100,200 --jobs 20000
+# linux-x86_64
+curl -fsSL -O https://github.com/redis-performance/bullmq-benchmark/releases/download/v0.1.0/bullmq-bench-v0.1.0-linux-x86_64-gnu.tar.gz \
+  -O https://github.com/redis-performance/bullmq-benchmark/releases/download/v0.1.0/bullmq-bench-v0.1.0-linux-x86_64-gnu.tar.gz.sha256
+sha256sum -c bullmq-bench-v0.1.0-linux-x86_64-gnu.tar.gz.sha256
+tar -xzf bullmq-bench-v0.1.0-linux-x86_64-gnu.tar.gz
+./bullmq-bench-v0.1.0-linux-x86_64-gnu/bullmq-bench --workers 10,50,100,200 --jobs 20000
+
+# linux-aarch64
+curl -fsSL -O https://github.com/redis-performance/bullmq-benchmark/releases/download/v0.1.0/bullmq-bench-v0.1.0-linux-aarch64-gnu.tar.gz \
+  -O https://github.com/redis-performance/bullmq-benchmark/releases/download/v0.1.0/bullmq-bench-v0.1.0-linux-aarch64-gnu.tar.gz.sha256
+sha256sum -c bullmq-bench-v0.1.0-linux-aarch64-gnu.tar.gz.sha256
+tar -xzf bullmq-bench-v0.1.0-linux-aarch64-gnu.tar.gz
+./bullmq-bench-v0.1.0-linux-aarch64-gnu/bullmq-bench --workers 10,50,100,200 --jobs 20000
 ```
 
-### From source
+### 3. Build from source
 
 ```bash
 cargo build --release
@@ -413,15 +438,12 @@ cargo clippy --all-targets -- -D warnings
 
 Multi-platform image (`linux/amd64`, `linux/arm64`) published to
 [`redis/bullmq-benchmark`](https://hub.docker.com/r/redis/bullmq-benchmark)
-on every push to `main`. Tagged `latest` on main; semver tags (`1.0.0`,
-`1.0`) on `v*` git tags.
+on every push to `main`. Tagged `latest` on main; semver tags (`0.1.0`,
+`0.1`) on `v*` git tags. See [Quick start](#quick-start) above for
+`docker pull`/`docker run` usage.
 
 ```bash
-# Pull and run
-docker pull redis/bullmq-benchmark
-docker run --rm --network host redis/bullmq-benchmark --workers 10 --jobs 5000
-
-# Build locally
+# Build locally instead of pulling
 docker build -t bullmq-bench .
 docker run --rm bullmq-bench --url redis://host:6379/0 --workers 10 --jobs 5000
 ```
