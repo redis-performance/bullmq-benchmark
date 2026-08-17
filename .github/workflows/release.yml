@@ -25,12 +25,12 @@ jobs:
           # workflow already proves QEMU works in this repo's CI, for the
           # multi-arch container image — this workflow just doesn't need it
           # since GitHub ships free hosted arm64 runners for public repos).
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-24.04
-            asset_name: linux-x86_64-gnu
-          - target: aarch64-unknown-linux-gnu
+            asset_name: linux-x86_64-musl
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
-            asset_name: linux-aarch64-gnu
+            asset_name: linux-aarch64-musl
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
@@ -41,13 +41,18 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
+      # rustls pulls in `ring`, which compiles C and assembly, so the musl target needs a musl
+      # C toolchain even though the rest of the tree is pure Rust.
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Build
-        run: cargo build --release
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Verify architecture
         run: |
           set -eu
-          BIN=target/release/bullmq-bench
+          BIN=target/${{ matrix.target }}/release/bullmq-bench
           file "$BIN"
           echo "--- ELF header ---"
           readelf -h "$BIN" | grep -E 'Class|Machine'
@@ -62,12 +67,28 @@ jobs:
           echo "--- running natively on ${{ matrix.os }} (proves it's not just correctly labeled, it actually executes on this arch) ---"
           "$BIN" --version
 
+      # Running the binary on the BUILD host (the step above) proves it executes there, which is
+      # exactly what it cannot tell us: the previous -gnu releases ran fine on ubuntu-24.04 and
+      # still required GLIBC_2.39, so they could not start on Ubuntu 22.04 (2.35), Debian 12 (2.36)
+      # or RHEL 9 (2.34). Assert the floor is gone rather than inferring it from a passing smoke.
+      - name: Assert no glibc dependency
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/bullmq-bench"
+          if objdump -T "$BIN" 2>/dev/null | grep -qE 'GLIBC_[0-9]+\.[0-9]+'; then
+            MAX=$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
+            echo "::error::artifact still links against glibc (max $MAX); it will not run on older hosts"
+            exit 1
+          fi
+          file "$BIN"
+          echo "OK: statically linked, no glibc version floor"
+
       - name: Package tarball
         run: |
           set -eu
           STAGE="bullmq-bench-${{ github.ref_name }}-${{ matrix.asset_name }}"
           mkdir -p "$STAGE"
-          cp target/release/bullmq-bench "$STAGE"/
+          cp target/${{ matrix.target }}/release/bullmq-bench "$STAGE"/
           cp LICENSE "$STAGE"/
           cp README.md "$STAGE"/
           tar -czf "${STAGE}.tar.gz" "$STAGE"
