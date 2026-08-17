@@ -36,6 +36,10 @@ jobs:
       - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # Required now that the build is cross-target: without this the musl std/core
+          # crates are never installed and cargo fails with "can't find crate for `core`".
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
