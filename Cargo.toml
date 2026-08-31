@@ -38,9 +38,16 @@ redis = { version = "1.5", features = ["tokio-comp", "tokio-rustls-comp", "tls-r
 # graph installs one on our behalf. Without this, `rustls::ClientConfig::builder()`
 # (called by redis-rs's TLS connector on *every* rediss:// connection, both
 # verifying and --insecure) panics with "Could not automatically determine
-# the process-level CryptoProvider...". "ring" is picked over "aws_lc_rs"
-# since it has no C/NASM toolchain requirement, matching this repo's static
-# musl release builds (see .github/workflows/release.yml).
+# the process-level CryptoProvider...". "ring" is picked over "aws_lc_rs" for
+# build simplicity, not because it avoids a C toolchain — it still compiles C
+# and assembly (that's exactly why .github/workflows/release.yml's musl
+# targets install `musl-tools`, per that workflow's own comment). The actual
+# advantage over "aws_lc_rs" is not needing cmake or NASM.
+#
+# NOTE: this crate's own rustls dependency must resolve (via Cargo's semver
+# unification) to the *same* rustls instance `redis`'s internal rustls
+# dependency links against — see main()'s install_crypto_provider() for what
+# breaks if it doesn't. `cargo tree -i rustls` can confirm there's only one.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # Async runtime
