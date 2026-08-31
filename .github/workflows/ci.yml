@@ -39,6 +39,24 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+      - name: Guard against tls-rustls-insecure feature regression
+        # There's no way for a binary crate to assert a *dependency's* Cargo feature
+        # is enabled at compile/test time — `#[cfg(feature = "...")]` only sees this
+        # crate's own features. If `tls-rustls-insecure` is ever dropped from the
+        # `redis` dependency in Cargo.toml (or from the resolved graph some other
+        # way), `--insecure` doesn't go quiet — every `--insecure`/`#insecure`
+        # connection attempt starts hard-failing at connect time instead (see the
+        # Cargo.toml comment next to the `redis` dependency, and the README "TLS"
+        # section). Check the resolved feature graph directly so that regression
+        # fails CI instead of surfacing as a support ticket. The TLS smoke test
+        # below would eventually catch this too, but this pinpoints the exact
+        # cause instantly instead of just failing a connection attempt.
+        run: |
+          cargo tree -e features -i redis --workspace | grep -q tls-rustls-insecure || {
+            echo "::error::tls-rustls-insecure is missing from the resolved 'redis' dependency's feature graph — --insecure would start hard-failing every connection instead of skipping cert verification. See the Cargo.toml comment next to the redis dependency."
+            exit 1
+          }
+
       - name: Build
         run: cargo build --release
 
@@ -65,3 +83,111 @@ jobs:
             .results[0].errors == 0 and
             .results[0].latency_us.total_count == 500
           ' /tmp/smoke.json
+
+      - name: TLS smoke test (self-signed cert — --tls/--insecure worker path)
+        # The above smoke test never passes --tls, so it exercises none of
+        # this code path. Standing up TLS needs a cert + a redis-server we
+        # control directly (not the `services:` container above, which
+        # doesn't make it easy to mount cert files), so it's a separate step.
+        #
+        # Covers two things a unit test can't: (1) that bullmq-official's
+        # RedisConnectionOptions actually preserves the `#insecure` fragment
+        # through to a real TLS handshake and worker/queue round trip, not
+        # just that build_redis_url() strings it on correctly, and (2) that
+        # connecting *without* --insecure against an untrusted self-signed
+        # cert fails cleanly (an anyhow error) rather than panicking — see
+        # install_crypto_provider()'s doc comment for the panic this guards
+        # against.
+        run: |
+          set -e
+          # The `redis:8.6` service above already binds host port 6379 for the
+          # whole job. Debian's redis-server package auto-starts its packaged
+          # unit (also on 6379 by default) from its postinst script the
+          # instant it's installed, which would collide with that service —
+          # possibly non-deterministically depending on the runner image's
+          # policy-rc.d default. Install a policy-rc.d that refuses every
+          # service (re)start request *before* installing the package, so the
+          # postinst's start attempt is a no-op; we start our own instance
+          # explicitly below, on its own distinct TLS-only port.
+          echo -e '#!/bin/sh\nexit 101' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+          sudo chmod +x /usr/sbin/policy-rc.d
+          sudo apt-get update && sudo apt-get install -y redis-server
+          # Belt and suspenders: confirm nothing is actually listening on
+          # 6379 from the package before we rely on our own instance below.
+          sudo systemctl stop redis-server 2>/dev/null || true
+          sudo systemctl disable redis-server 2>/dev/null || true
+
+          openssl req -x509 -newkey rsa:2048 -nodes \
+            -keyout /tmp/tls-key.pem -out /tmp/tls-cert.pem -days 1 -subj /CN=localhost
+
+          redis-server --port 0 --tls-port 16390 \
+            --tls-cert-file /tmp/tls-cert.pem \
+            --tls-key-file /tmp/tls-key.pem \
+            --tls-ca-cert-file /tmp/tls-cert.pem \
+            --tls-cluster no --tls-replication no --tls-auth-clients no \
+            --daemonize no --logfile /tmp/tls-redis.log --pidfile /tmp/tls-redis.pid &
+
+          for i in $(seq 1 30); do
+            redis-cli -h 127.0.0.1 -p 16390 --tls --insecure ping >/dev/null 2>&1 && break
+            sleep 0.5
+          done
+          redis-cli -h 127.0.0.1 -p 16390 --tls --insecure ping
+
+          echo "--- --tls --insecure: expect real job throughput through the worker path ---"
+          cargo run --release -- \
+            --url rediss://127.0.0.1:16390/0 \
+            --tls --insecure \
+            --workers 2 \
+            --jobs 100 \
+            --timeout 60 \
+            --output /tmp/tls-smoke.json \
+            --quiet \
+            --tag tls-smoke
+          jq -e '
+            .results[0].total_jobs == 100 and
+            .results[0].timed_out == false and
+            .results[0].errors == 0
+          ' /tmp/tls-smoke.json
+
+          echo "--- --tls without --insecure: expect a clean cert-verification failure, not a panic ---"
+          set +e
+          cargo run --release -- \
+            --url rediss://127.0.0.1:16390/0 \
+            --tls \
+            --workers 1 \
+            --jobs 1 \
+            --timeout 10 \
+            --output /tmp/tls-fail.json \
+            --quiet \
+            --tag tls-fail 2>/tmp/tls-fail.stderr
+          status=$?
+          set -e
+          cat /tmp/tls-fail.stderr
+          if [ "$status" -eq 0 ]; then
+            echo "expected this run to fail against an untrusted self-signed cert (no --insecure), but it exited 0" >&2
+            exit 1
+          fi
+          if grep -qi "panic" /tmp/tls-fail.stderr; then
+            echo "run without --insecure panicked instead of failing cleanly" >&2
+            exit 1
+          fi
+          # A bare non-zero exit + no "panic" string is satisfied by
+          # connection-refused, a wrong cert path, or the server not
+          # listening yet — none of which prove certificate verification
+          # actually ran and rejected the cert. Require the real
+          # rustls/redis-rs rejection text so this only passes when
+          # verification genuinely fired. Confirmed locally against this
+          # exact self-signed cert:
+          #   Error: failed to connect to Redis
+          #   Caused by:
+          #       0: invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))
+          # "invalid peer certificate" is the stable rustls-level prefix
+          # webpki/rustls uses for every certificate-rejection reason (also
+          # covers e.g. UnknownIssuer on other cert shapes), so grep on that
+          # rather than the more specific CaUsedAsEndEntity variant.
+          if ! grep -qi "invalid peer certificate" /tmp/tls-fail.stderr; then
+            echo "run without --insecure failed, but not with the expected certificate-verification error (invalid peer certificate) — this doesn't prove verification actually ran" >&2
+            exit 1
+          fi
+
+          kill "$(cat /tmp/tls-redis.pid)" 2>/dev/null || true
