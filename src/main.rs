@@ -44,6 +44,14 @@ struct Cli {
     #[arg(long, env = "REDIS_TLS")]
     tls: bool,
 
+    /// Skip TLS certificate verification (only meaningful with --tls).
+    /// Needed to connect to servers presenting a self-signed or private-CA
+    /// certificate — the normal case for test/staging/ephemeral benchmark
+    /// deployments. This intentionally disables a real security check:
+    /// never use it against an endpoint you don't control.
+    #[arg(long, env = "REDIS_TLS_INSECURE", requires = "tls")]
+    insecure: bool,
+
     /// Redis database number. When omitted, the db in --url is used, falling back to 13
     /// (the Ruby sidekiqload safety default). Note db > 0 does not exist on Redis Cluster
     /// or most managed Redis, so `--db 0` is usually required against those.
@@ -166,6 +174,16 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
         u.set_path(&format!("/{db}"));
     } else if u.path().trim_matches('/').is_empty() {
         u.set_path("/13");
+    }
+
+    // redis-rs's TLS-insecure escape hatch: appending `#insecure` to a
+    // rediss:// URL tells the client to skip certificate verification. Only
+    // meaningful once the scheme has actually been upgraded to rediss:// —
+    // clap's `requires = "tls"` on --insecure already prevents this being
+    // set without --tls, but the scheme check keeps this function correct
+    // standalone too.
+    if cli.insecure && u.scheme() == "rediss" {
+        u.set_fragment(Some("insecure"));
     }
 
     Ok(u.to_string())
@@ -938,6 +956,7 @@ mod tests {
             port: None,
             password: None,
             tls: false,
+            insecure: false,
             db: Some(0),
             workers: vec![10],
             jobs: 1000,
@@ -967,6 +986,7 @@ mod tests {
             port: None,
             password: Some("p@ss/word".into()),
             tls: false,
+            insecure: false,
             db: Some(0),
             workers: vec![10],
             jobs: 1000,
@@ -997,6 +1017,7 @@ mod tests {
             port: None,
             password: None,
             tls: true,
+            insecure: false,
             db: Some(0),
             workers: vec![10],
             jobs: 1000,
@@ -1016,6 +1037,71 @@ mod tests {
     }
 
     #[test]
+    fn build_redis_url_appends_insecure_fragment_with_tls_and_insecure() {
+        let cli = Cli {
+            url: "redis://127.0.0.1:6379/0".into(),
+            host: None,
+            port: None,
+            password: None,
+            tls: true,
+            insecure: true,
+            db: Some(0),
+            workers: vec![10],
+            jobs: 1000,
+            warmup_jobs: 0,
+            queue: "default".into(),
+            num_queues: 1,
+            latency_percentiles: vec![],
+            tag: None,
+            output: None,
+            timeout: 300,
+            quiet: false,
+            allow_flushdb: false,
+            allow_obliterate_active: false,
+        };
+        let url = build_redis_url(&cli).unwrap();
+        assert!(url.starts_with("rediss://"), "expected rediss:// got {url}");
+        assert!(
+            url.ends_with("#insecure"),
+            "expected #insecure fragment, got {url}"
+        );
+    }
+
+    #[test]
+    fn build_redis_url_ignores_insecure_without_tls() {
+        // clap's `requires = "tls"` already prevents this combination from
+        // parsing on the CLI, but build_redis_url must stay safe standalone:
+        // never emit `#insecure` on a plain (non-TLS) redis:// URL.
+        let cli = Cli {
+            url: "redis://127.0.0.1:6379/0".into(),
+            host: None,
+            port: None,
+            password: None,
+            tls: false,
+            insecure: true,
+            db: Some(0),
+            workers: vec![10],
+            jobs: 1000,
+            warmup_jobs: 0,
+            queue: "default".into(),
+            num_queues: 1,
+            latency_percentiles: vec![],
+            tag: None,
+            output: None,
+            timeout: 300,
+            quiet: false,
+            allow_flushdb: false,
+            allow_obliterate_active: false,
+        };
+        let url = build_redis_url(&cli).unwrap();
+        assert!(url.starts_with("redis://"), "expected redis:// got {url}");
+        assert!(
+            !url.contains("insecure"),
+            "insecure fragment leaked onto a non-TLS URL: {url}"
+        );
+    }
+
+    #[test]
     fn build_redis_url_host_port_override() {
         let cli = Cli {
             url: "redis://127.0.0.1:6379/0".into(),
@@ -1023,6 +1109,7 @@ mod tests {
             port: Some(6380),
             password: None,
             tls: false,
+            insecure: false,
             db: Some(0),
             workers: vec![10],
             jobs: 1000,
@@ -1103,6 +1190,7 @@ mod tests {
             port: None,
             password: None,
             tls: false,
+            insecure: false,
             db: Some(13),
             workers: vec![10, 50],
             jobs: 1000,
@@ -1179,6 +1267,7 @@ mod tests {
             port: None,
             password: None,
             tls: false,
+            insecure: false,
             db: Some(0),
             workers: vec![10],
             jobs: 1000,
@@ -1204,6 +1293,7 @@ mod tests {
             port: None,
             password: None,
             tls: false,
+            insecure: false,
             db: None,
             workers: vec![10],
             jobs: 1000,
@@ -1229,6 +1319,7 @@ mod tests {
             port: None,
             password: None,
             tls: false,
+            insecure: false,
             db: None,
             workers: vec![10],
             jobs: 1000,

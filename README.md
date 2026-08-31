@@ -259,6 +259,7 @@ cargo build --release
 | `--port` | — | — | Override port component of URL |
 | `--password` | `REDIS_PASSWORD` | — | Auth (prefer env var — CLI exposes it in `ps`) |
 | `--tls` | `REDIS_TLS` | false | Enable TLS (`rediss://`) |
+| `--insecure` | `REDIS_TLS_INSECURE` | false | Skip TLS certificate verification (requires `--tls`). Needed for self-signed/private-CA certs — the normal case for test/staging/ephemeral deployments. Never use against an endpoint you don't control |
 | `--db` | — | `13` | Database number (safety convention carried over from sidekiq-benchmark; BullMQ has no special default db) |
 | `--workers` | — | `10,50,100,200` | Comma-separated concurrency levels — one trial each. Each level spawns that many separate `bullmq::Worker` instances |
 | `--jobs` | — | `20000` | Total jobs per trial (lower than sidekiq-benchmark's 500,000 — see Protocol compatibility) |

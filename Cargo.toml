@@ -28,7 +28,7 @@ bullmq-official = "1.2"
 # Redis client — used directly (outside the bullmq-official crate) for the
 # one-off INFO tag lookup and --allow-flushdb. bullmq-official pins an exact
 # "=1.5.0"; we track the same minor line so the dependency graph unifies.
-redis = { version = "1.5", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+redis = { version = "1.5", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots", "tls-rustls-insecure"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
