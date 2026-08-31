@@ -30,6 +30,19 @@ bullmq-official = "1.2"
 # "=1.5.0"; we track the same minor line so the dependency graph unifies.
 redis = { version = "1.5", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots", "tls-rustls-insecure"] }
 
+# Direct dependency on rustls purely to select+install a process-wide default
+# CryptoProvider (see main()'s first line). `redis`'s own Cargo.toml pulls in
+# rustls with `default-features = false` and only requests the "std" feature
+# (verified via `cargo tree -e features -i rustls`) — it does NOT enable
+# either crypto backend ("ring" / "aws_lc_rs"), so nothing in the dependency
+# graph installs one on our behalf. Without this, `rustls::ClientConfig::builder()`
+# (called by redis-rs's TLS connector on *every* rediss:// connection, both
+# verifying and --insecure) panics with "Could not automatically determine
+# the process-level CryptoProvider...". "ring" is picked over "aws_lc_rs"
+# since it has no C/NASM toolchain requirement, matching this repo's static
+# musl release builds (see .github/workflows/release.yml).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 

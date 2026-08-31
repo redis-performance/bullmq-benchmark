@@ -259,7 +259,7 @@ cargo build --release
 | `--port` | — | — | Override port component of URL |
 | `--password` | `REDIS_PASSWORD` | — | Auth (prefer env var — CLI exposes it in `ps`) |
 | `--tls` | `REDIS_TLS` | false | Enable TLS (`rediss://`) |
-| `--insecure` | `REDIS_TLS_INSECURE` | false | Skip TLS certificate verification (requires `--tls`). Needed for self-signed/private-CA certs — the normal case for test/staging/ephemeral deployments. Never use against an endpoint you don't control |
+| `--insecure` | `REDIS_TLS_INSECURE` | false | Skip TLS certificate verification (needs the connection to resolve to `rediss://` — via `--tls` or an already-`rediss://` `--url`). Needed for self-signed/private-CA certs — the normal case for test/staging/ephemeral deployments. See [Safety notes](#safety-notes) |
 | `--db` | — | `13` | Database number (safety convention carried over from sidekiq-benchmark; BullMQ has no special default db) |
 | `--workers` | — | `10,50,100,200` | Comma-separated concurrency levels — one trial each. Each level spawns that many separate `bullmq::Worker` instances |
 | `--jobs` | — | `20000` | Total jobs per trial (lower than sidekiq-benchmark's 500,000 — see Protocol compatibility) |
@@ -414,6 +414,34 @@ that makes `force` alone insufficient. Covered by
 `tests/integration_redis.rs`, which reproduces the upstream bug directly
 (keeps a job active with a slow processor, confirms `force=false` behavior
 without this gate would have removed it, then confirms the gate blocks it).
+
+### `--insecure` disables TLS certificate verification
+
+`--insecure` (or `REDIS_TLS_INSECURE=1`) tells the Redis client to skip
+certificate verification entirely on a `rediss://` connection — it will
+accept *any* certificate the server presents, self-signed, expired, or
+issued for a completely different host. That's the whole point when
+connecting to a test/staging/ephemeral deployment with a self-signed or
+private-CA certificate, where the normal alternative (installing that CA
+into the trust store) is often impractical for a one-off benchmark run.
+
+The failure mode you're trading away: without certificate verification,
+nothing stops a man-in-the-middle from presenting its own certificate and
+transparently proxying (or tampering with) the connection — TLS still
+encrypts the wire, but no longer proves you're actually talking to the
+Redis server you think you are. **Never use `--insecure` against an
+endpoint you don't fully control** (i.e., anything reachable over a network
+path you don't trust end-to-end). It's fine for a Redis container on
+`localhost` or inside an isolated CI network; it is not fine for a
+staging/production endpoint reachable over the open internet or a shared
+VPC.
+
+`--insecure` does not require `--tls` to also be passed — it only requires
+that the connection resolves to `rediss://` one way or another (`--tls`
+upgrades a `redis://` `--url`, or `--url`/`REDIS_URL` can already be
+`rediss://`). Passing `--insecure` when the resolved scheme is not
+`rediss://` (e.g. a plain `redis://` URL, or `unix://`, which `--tls` cannot
+upgrade) is a hard error — see `validate_cli` in `src/main.rs`.
 
 ### Jobs are removed on completion — unlike BullMQ's own default
 

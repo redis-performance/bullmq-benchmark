@@ -44,12 +44,20 @@ struct Cli {
     #[arg(long, env = "REDIS_TLS")]
     tls: bool,
 
-    /// Skip TLS certificate verification (only meaningful with --tls).
-    /// Needed to connect to servers presenting a self-signed or private-CA
-    /// certificate — the normal case for test/staging/ephemeral benchmark
-    /// deployments. This intentionally disables a real security check:
-    /// never use it against an endpoint you don't control.
-    #[arg(long, env = "REDIS_TLS_INSECURE", requires = "tls")]
+    /// Skip TLS certificate verification (only meaningful once the resolved
+    /// connection scheme is rediss:// — either via --tls or a rediss://
+    /// --url/REDIS_URL passed directly). Needed to connect to servers
+    /// presenting a self-signed or private-CA certificate — the normal case
+    /// for test/staging/ephemeral benchmark deployments. This intentionally
+    /// disables a real security check: never use it against an endpoint you
+    /// don't control. See README's Safety notes.
+    ///
+    /// Deliberately NOT gated with clap's `requires = "tls"`: that would
+    /// reject `--url rediss://host:6380/0 --insecure` (no --tls needed —
+    /// the URL is already rediss://) and `REDIS_TLS_INSECURE=1` with
+    /// REDIS_TLS unset. validate_cli() below checks the resolved scheme
+    /// instead, agreeing with build_redis_url()'s own upgrade rule.
+    #[arg(long, env = "REDIS_TLS_INSECURE")]
     insecure: bool,
 
     /// Redis database number. When omitted, the db in --url is used, falling back to 13
@@ -178,15 +186,39 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
 
     // redis-rs's TLS-insecure escape hatch: appending `#insecure` to a
     // rediss:// URL tells the client to skip certificate verification. Only
-    // meaningful once the scheme has actually been upgraded to rediss:// —
-    // clap's `requires = "tls"` on --insecure already prevents this being
-    // set without --tls, but the scheme check keeps this function correct
-    // standalone too.
+    // meaningful once the scheme has actually resolved to rediss:// — via
+    // --tls above, or because --url/REDIS_URL was already rediss://.
+    // validate_cli()'s resolves_to_tls_scheme() check is what rejects
+    // --insecure on a non-TLS scheme (there's no `requires = "tls"` on the
+    // clap arg — see its doc comment); the scheme check here just keeps this
+    // function correct standalone too.
+    //
+    // NOTE: `set_fragment` silently overwrites any fragment already present
+    // on a user-supplied `--url` (e.g. `--url rediss://host/0#foo --insecure`
+    // would drop `#foo`). Harmless in documented usage — redis-rs only ever
+    // interprets the `#insecure` fragment itself, and no other fragment value
+    // has meaning here — but noted for completeness.
     if cli.insecure && u.scheme() == "rediss" {
         u.set_fragment(Some("insecure"));
     }
 
     Ok(u.to_string())
+}
+
+/// Whether the connection will end up on the rediss:// (TLS) scheme once
+/// --tls is applied, mirroring build_redis_url()'s own upgrade rule
+/// (`cli.tls && u.scheme() == "redis"`). Shared by validate_cli() so the two
+/// agree on edge cases like `--insecure --url unix:///tmp/redis.sock` — a
+/// raw `cli.tls` check alone would miss that --url can already be rediss://
+/// without --tls being passed, and a raw `cli.url.starts_with("rediss://")`
+/// check would miss that --tls never upgrades a non-redis scheme.
+/// An unparseable --url is treated as "not TLS" here; build_redis_url()
+/// still reports the actual parse error.
+fn resolves_to_tls_scheme(cli: &Cli) -> bool {
+    match url::Url::parse(&cli.url) {
+        Ok(u) => u.scheme() == "rediss" || (cli.tls && u.scheme() == "redis"),
+        Err(_) => false,
+    }
 }
 
 /// Return the URL with any embedded password replaced by `****`, for
@@ -640,6 +672,12 @@ fn validate_cli(cli: &Cli) -> Result<()> {
         "--workers values must all be > 0 (got 0 — a 0-worker trial can never complete and \
          would just burn the full --timeout doing nothing)"
     );
+    anyhow::ensure!(
+        !cli.insecure || resolves_to_tls_scheme(cli),
+        "--insecure only makes sense once the connection resolves to rediss:// — pass --tls, \
+         or use a rediss:// --url/REDIS_URL. Plain redis:// connections (and non-redis schemes \
+         like unix://, which --tls cannot upgrade) have no certificate verification to skip"
+    );
     Ok(())
 }
 
@@ -647,9 +685,34 @@ fn validate_cli(cli: &Cli) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install a process-wide default rustls CryptoProvider *before* any
+    // Redis connection is attempted. `redis`'s own `rustls` dependency is
+    // built with `default-features = false` and enables neither the "ring"
+    // nor "aws_lc_rs" crate feature (see Cargo.toml's `rustls` entry for the
+    // full explanation), so nothing else in the dependency graph installs
+    // one. Without this, `rustls::ClientConfig::builder()` — called on every
+    // rediss:// connection attempt, verifying or --insecure alike — panics
+    // with "Could not automatically determine the process-level
+    // CryptoProvider...". This must run exactly once, hence `install_default`
+    // (not `.expect()` on every connection attempt).
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls ring CryptoProvider (should only be called once)");
+
     let cli = Cli::parse();
 
     validate_cli(&cli)?;
+
+    // Warn loudly that certificate verification is off — this is the whole point of
+    // --insecure, but it's a silent security downgrade otherwise (man-in-the-middle
+    // exposure), so it shouldn't pass without a visible trace in the output.
+    if cli.insecure {
+        eprintln!(
+            "warning: TLS certificate verification is disabled (--insecure) — never use \
+             this against a production endpoint you don't control."
+        );
+    }
+
     if let Some(&max_w) = cli.workers.iter().max() {
         if max_w > 256 {
             eprintln!(
@@ -1245,6 +1308,88 @@ mod tests {
         let mut cli = base_cli();
         cli.workers = vec![10, 0, 50];
         assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_insecure_without_tls() {
+        let mut cli = base_cli();
+        cli.insecure = true;
+        let err = validate_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("--insecure"));
+    }
+
+    #[test]
+    fn validate_cli_accepts_insecure_with_tls() {
+        let mut cli = base_cli();
+        cli.tls = true;
+        cli.insecure = true;
+        assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_accepts_insecure_with_rediss_url_and_no_tls_flag() {
+        // The whole point of not using clap's `requires = "tls"`: --url already
+        // being rediss:// is sufficient, --tls need not also be passed.
+        let mut cli = base_cli();
+        cli.url = "rediss://127.0.0.1:6380/0".into();
+        cli.insecure = true;
+        assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_rejects_insecure_with_tls_on_non_redis_scheme() {
+        // --tls can't upgrade a unix:// socket URL to rediss://, so --insecure
+        // has nothing to do there even with --tls set.
+        let mut cli = base_cli();
+        cli.url = "unix:///tmp/redis.sock".into();
+        cli.tls = true;
+        cli.insecure = true;
+        let err = validate_cli(&cli).unwrap_err();
+        assert!(err.to_string().contains("--insecure"));
+    }
+
+    #[test]
+    fn cli_try_parse_from_accepts_insecure_without_tls_flag() {
+        // clap itself must accept this combination (no `requires = "tls"`
+        // constraint at parse time) — validate_cli() is where it's actually
+        // gated, exercised separately above.
+        let cli = Cli::try_parse_from(["bullmq-bench", "--insecure"]).expect("should parse");
+        assert!(cli.insecure);
+        assert!(!cli.tls);
+    }
+
+    #[test]
+    fn cli_try_parse_from_accepts_tls_and_insecure_together() {
+        let cli =
+            Cli::try_parse_from(["bullmq-bench", "--tls", "--insecure"]).expect("should parse");
+        assert!(cli.tls);
+        assert!(cli.insecure);
+    }
+
+    #[test]
+    fn cli_command_debug_assert() {
+        // Cheap guard that the clap `Command` definition itself stays valid
+        // (conflicting args, bad defaults, etc.) as --insecure's validation
+        // moves from a clap-level `requires` into validate_cli().
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn resolves_to_tls_scheme_cases() {
+        let mut cli = base_cli();
+        assert!(!resolves_to_tls_scheme(&cli)); // plain redis://, no --tls
+
+        cli.tls = true;
+        assert!(resolves_to_tls_scheme(&cli)); // --tls upgrades redis:// → rediss://
+
+        cli.tls = false;
+        cli.url = "rediss://127.0.0.1:6380/0".into();
+        assert!(resolves_to_tls_scheme(&cli)); // already rediss://, no --tls needed
+
+        cli.url = "unix:///tmp/redis.sock".into();
+        cli.tls = true;
+        assert!(!resolves_to_tls_scheme(&cli)); // --tls can't upgrade unix://
     }
 
     #[test]
