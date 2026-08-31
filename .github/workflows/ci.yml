@@ -82,7 +82,22 @@ jobs:
         # against.
         run: |
           set -e
+          # The `redis:8.6` service above already binds host port 6379 for the
+          # whole job. Debian's redis-server package auto-starts its packaged
+          # unit (also on 6379 by default) from its postinst script the
+          # instant it's installed, which would collide with that service —
+          # possibly non-deterministically depending on the runner image's
+          # policy-rc.d default. Install a policy-rc.d that refuses every
+          # service (re)start request *before* installing the package, so the
+          # postinst's start attempt is a no-op; we start our own instance
+          # explicitly below, on its own distinct TLS-only port.
+          echo -e '#!/bin/sh\nexit 101' | sudo tee /usr/sbin/policy-rc.d >/dev/null
+          sudo chmod +x /usr/sbin/policy-rc.d
           sudo apt-get update && sudo apt-get install -y redis-server
+          # Belt and suspenders: confirm nothing is actually listening on
+          # 6379 from the package before we rely on our own instance below.
+          sudo systemctl stop redis-server 2>/dev/null || true
+          sudo systemctl disable redis-server 2>/dev/null || true
 
           openssl req -x509 -newkey rsa:2048 -nodes \
             -keyout /tmp/tls-key.pem -out /tmp/tls-cert.pem -days 1 -subj /CN=localhost
@@ -136,6 +151,24 @@ jobs:
           fi
           if grep -qi "panic" /tmp/tls-fail.stderr; then
             echo "run without --insecure panicked instead of failing cleanly" >&2
+            exit 1
+          fi
+          # A bare non-zero exit + no "panic" string is satisfied by
+          # connection-refused, a wrong cert path, or the server not
+          # listening yet — none of which prove certificate verification
+          # actually ran and rejected the cert. Require the real
+          # rustls/redis-rs rejection text so this only passes when
+          # verification genuinely fired. Confirmed locally against this
+          # exact self-signed cert:
+          #   Error: failed to connect to Redis
+          #   Caused by:
+          #       0: invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))
+          # "invalid peer certificate" is the stable rustls-level prefix
+          # webpki/rustls uses for every certificate-rejection reason (also
+          # covers e.g. UnknownIssuer on other cert shapes), so grep on that
+          # rather than the more specific CaUsedAsEndEntity variant.
+          if ! grep -qi "invalid peer certificate" /tmp/tls-fail.stderr; then
+            echo "run without --insecure failed, but not with the expected certificate-verification error (invalid peer certificate) — this doesn't prove verification actually ran" >&2
             exit 1
           fi
 

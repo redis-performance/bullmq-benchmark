@@ -443,6 +443,16 @@ upgrades a `redis://` `--url`, or `--url`/`REDIS_URL` can already be
 `rediss://` (e.g. a plain `redis://` URL, or `unix://`, which `--tls` cannot
 upgrade) is a hard error — see `validate_cli` in `src/main.rs`.
 
+**Don't set `REDIS_TLS_INSECURE=1` unconditionally in a shared
+environment/image.** Because that hard-error check has no way to tell "you
+forgot `--tls`" apart from "this invocation was never meant to use TLS", a
+`REDIS_TLS_INSECURE=1` baked into a shared env, CI job, or container image
+will hard-fail *every* plain `redis://` run made in that environment, not
+just the TLS ones — including runs that never intended to touch TLS at all.
+That's the deliberate tradeoff (a loud failure beats a silently-ignored
+flag), but it means this variable should be set per-invocation (or scoped to
+a job step) alongside `REDIS_TLS`/`--tls`, never as a blanket default.
+
 ### Jobs are removed on completion — unlike BullMQ's own default
 
 Node.js BullMQ's out-of-the-box default is to *keep* every completed job's
