@@ -417,7 +417,7 @@ without this gate would have removed it, then confirms the gate blocks it).
 
 ### `--insecure` disables TLS certificate verification
 
-`--insecure` (or `REDIS_TLS_INSECURE=1`) tells the Redis client to skip
+`--insecure` (or `REDIS_TLS_INSECURE=true`) tells the Redis client to skip
 certificate verification entirely on a `rediss://` connection — it will
 accept *any* certificate the server presents, self-signed, expired, or
 issued for a completely different host. That's the whole point when
@@ -443,15 +443,19 @@ upgrades a `redis://` `--url`, or `--url`/`REDIS_URL` can already be
 `rediss://` (e.g. a plain `redis://` URL, or `unix://`, which `--tls` cannot
 upgrade) is a hard error — see `validate_cli` in `src/main.rs`.
 
-**Don't set `REDIS_TLS_INSECURE=1` unconditionally in a shared
-environment/image.** Because that hard-error check has no way to tell "you
-forgot `--tls`" apart from "this invocation was never meant to use TLS", a
-`REDIS_TLS_INSECURE=1` baked into a shared env, CI job, or container image
-will hard-fail *every* plain `redis://` run made in that environment, not
-just the TLS ones — including runs that never intended to touch TLS at all.
-That's the deliberate tradeoff (a loud failure beats a silently-ignored
-flag), but it means this variable should be set per-invocation (or scoped to
-a job step) alongside `REDIS_TLS`/`--tls`, never as a blanket default.
+**Don't set `REDIS_TLS_INSECURE=true` unconditionally in a shared
+environment/image.** That env var is clap's env-backed boolean flag for
+`--insecure` — it only accepts the literal strings `true`/`false` (anything
+else, e.g. `REDIS_TLS_INSECURE=1`, is a hard parse error on *every*
+invocation, TLS or not). Setting it to `true` unconditionally effectively
+turns `--insecure` "on" for every run in that environment. Because the
+`validate_cli` hard-error check has no way to tell "you forgot `--tls`"
+apart from "this invocation was never meant to use TLS", that will hard-fail
+every plain `redis://` run made in that environment too, not just the TLS
+ones — including runs that never intended to touch TLS at all. That's the
+deliberate tradeoff (a loud failure beats a silently-ignored flag), but it
+means this variable should be set per-invocation (or scoped to a job step)
+alongside `REDIS_TLS`/`--tls`, never as a blanket default.
 
 ### Jobs are removed on completion — unlike BullMQ's own default
 

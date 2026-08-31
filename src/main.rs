@@ -283,7 +283,8 @@ fn sanitize_tag(tag: &str) -> String {
 }
 
 /// Whether the final connection URL has TLS certificate verification
-/// disabled — i.e. its fragment is exactly `insecure`.
+/// disabled — i.e. it's a `rediss://` URL whose fragment is exactly
+/// `insecure`.
 ///
 /// This is deliberately checked against the *built* URL rather than
 /// `cli.insecure` directly: `build_redis_url()` only ever writes the
@@ -293,9 +294,16 @@ fn sanitize_tag(tag: &str) -> String {
 /// that function's own fragment-handling comment. The security-downgrade
 /// warning in `main()` needs to fire in that case too, not just when
 /// `cli.insecure` was explicitly passed.
+///
+/// The scheme check matters: redis-rs only ever interprets the `#insecure`
+/// fragment on a `rediss://` connection. A plain `redis://host/0#insecure`
+/// URL is cleartext already — there's no TLS certificate verification to
+/// disable — so without this check the warning would fire for the wrong
+/// reason (claiming "TLS certificate verification is disabled" on a
+/// connection that never had TLS in the first place).
 fn url_is_insecure(url: &str) -> bool {
     url::Url::parse(url)
-        .map(|u| u.fragment() == Some("insecure"))
+        .map(|u| u.scheme() == "rediss" && u.fragment() == Some("insecure"))
         .unwrap_or(false)
 }
 
@@ -1455,6 +1463,18 @@ mod tests {
     #[test]
     fn url_is_insecure_false_on_unparseable_url() {
         assert!(!url_is_insecure("not a url"));
+    }
+
+    #[test]
+    fn url_is_insecure_false_on_plain_redis_scheme_with_insecure_fragment() {
+        // Regression: url_is_insecure() used to check only the fragment, not
+        // the scheme, so a plain (non-TLS) redis:// URL that happens to carry
+        // a literal `#insecure` fragment would trip the "TLS certificate
+        // verification is disabled" warning — misleading, since redis-rs
+        // never looks at a fragment on a non-rediss:// URL, and there's no
+        // TLS certificate verification to have disabled on a cleartext
+        // connection in the first place.
+        assert!(!url_is_insecure("redis://127.0.0.1:6379/0#insecure"));
     }
 
     #[test]
